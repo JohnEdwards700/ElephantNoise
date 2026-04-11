@@ -1,7 +1,7 @@
 import pandas as pd
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 ANNOTATIONS_CSV = PROJECT_ROOT / "data" / "annotations" / "calls.csv"
 AUDIO_DIR = PROJECT_ROOT / "data" / "raw_audio"
