@@ -1,0 +1,8 @@
+# Ignore generated mapping output
+audio_spectrogram_mapping.csv
+
+# Ignore all generated files/folders in this outputs directory
+*
+
+# Keep this file tracked
+!.gitignore
