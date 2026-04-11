@@ -1,0 +1,6 @@
+Copy of Audio Files Master (04_10_2026) - 20260324_rumbles_in_noise_for_hackathon.csv
+# Ignore all generated files/folders in this outputs directory
+*
+
+# Keep this file tracked
+!.gitignore
