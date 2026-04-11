@@ -1,28 +1,25 @@
 import pandas as pd
 from pathlib import Path
 
-ANNOTATIONS_CSV = Path(
-    "/home/jtedwards/Ubuntu_Code/Projects/Elephant_Noise/Copy of Audio Files Master (04_10_2026) - 20260324_rumbles_in_noise_for_hackathon.csv"
-)
-AUDIO_DIR = Path(
-    "/home/jtedwards/Ubuntu_Code/Projects/Elephant_Noise/2026)-20260411T194629Z-3-001/Audio Files (04-10-2026)"
-)
-SPECTRO_DIR = Path(
-    "/home/jtedwards/Ubuntu_Code/Projects/Elephant_Noise/2026)-20260411T194554Z-3-001/Spectro Files (04-10-2026)"
-)
-OUT_CSV = Path(
-    "/home/jtedwards/Ubuntu_Code/Projects/Elephant_Noise/ElephantNoise/backend/Noise Cleanup/outputs/audio_spectrogram_mapping.csv"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+ANNOTATIONS_CSV = PROJECT_ROOT / "data" / "annotations" / "calls.csv"
+AUDIO_DIR = PROJECT_ROOT / "data" / "raw_audio"
+SPECTRO_DIR = PROJECT_ROOT / "data" / "spectrogram_refs"
+OUT_CSV = PROJECT_ROOT / "outputs" / "audio_spectrogram_mapping.csv"
+
 
 def find_spectrogram(base_name: str, selection: int) -> Path | None:
     expected = f"{base_name}_Selection_{selection}.png"
     p1 = SPECTRO_DIR / expected
-    p2 = SPECTRO_DIR / f"{expected}:Zone.Identifier"  # if Windows ADS artifact is present
+    p2 = SPECTRO_DIR / f"{expected}:Zone.Identifier"
+
     if p1.exists():
         return p1
     if p2.exists():
         return p2
     return None
+
 
 def main():
     df = pd.read_csv(ANNOTATIONS_CSV)
@@ -57,6 +54,7 @@ def main():
 
     print(f"Saved mapping: {OUT_CSV}")
     print(out_df[["audio_exists", "spectrogram_exists"]].value_counts().to_string())
+
 
 if __name__ == "__main__":
     main()
