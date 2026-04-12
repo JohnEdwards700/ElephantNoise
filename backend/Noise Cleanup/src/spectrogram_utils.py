@@ -15,7 +15,7 @@ from typing import Tuple
 import numpy as np
 import librosa
 
-from config import (
+from .config import (
     N_FFT,
     HOP_LENGTH,
     WIN_LENGTH,

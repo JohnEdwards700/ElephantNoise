@@ -14,7 +14,7 @@ This file orchestrates:
 - returning metadata + output paths
 """
 
-from config import (
+from .config import (
     CROP_BUFFER_SEC,
     HOP_LENGTH,
     WIN_LENGTH,
@@ -27,7 +27,7 @@ from config import (
     COMPARISON_PLOT_SUFFIX,
     ensure_output_dirs,
 )
-from io_utils import (
+from .io_utils import (
     load_mapping_csv,
     get_call_by_selection,
     load_audio,
@@ -35,19 +35,19 @@ from io_utils import (
     build_cleaned_audio_path,
     summarize_call_row,
 )
-from spectrogram_utils import (
+from .spectrogram_utils import (
     crop_audio,
     compute_stft,
     stft_to_mag_phase,
     reconstruct_from_mag_phase,
     time_to_frame,
 )
-from noise_estimation import (
+from .noise_estimation import (
     get_noise_frame_ranges,
     estimate_noise_profile_from_frame_ranges,
 )
-from spectral_subtraction import spectral_subtract
-from visualization import (
+from .spectral_subtraction import spectral_subtract
+from .visualization import (
     plot_spectrogram,
     plot_before_after,
     plot_noise_profile,

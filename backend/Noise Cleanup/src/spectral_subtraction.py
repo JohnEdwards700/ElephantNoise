@@ -11,7 +11,7 @@ This file handles:
 
 import numpy as np
 
-from config import ALPHA, BETA, EPSILON
+from .config import ALPHA, BETA, EPSILON
 
 
 def apply_floor(

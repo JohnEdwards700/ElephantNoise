@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import librosa.display
 import numpy as np
 
-from config import (
+from .config import (
     HOP_LENGTH,
     N_FFT,
     FMIN_PLOT,
@@ -28,7 +28,7 @@ from config import (
     PLOTS_DIR,
     ensure_output_dirs,
 )
-from spectrogram_utils import magnitude_to_db
+from .spectrogram_utils import magnitude_to_db
 
 
 def _ensure_parent_dir(output_path: str | Path) -> Path:

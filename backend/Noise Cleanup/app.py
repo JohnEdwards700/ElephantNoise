@@ -1,81 +1,130 @@
 import base64
-import time
-from pathlib import Path
+import io
+import re
+from dataclasses import dataclass
 from html import escape
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-import librosa
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import soundfile as sf
 import streamlit as st
 import streamlit.components.v1 as components
 from matplotlib.collections import PolyCollection
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 from src import config
-from src.io_utils import load_audio, save_audio
-from src.noise_estimation import estimate_noise_profile, smooth_noise_profile
-from src.spectral_subtraction import spectral_subtraction
-from src.spectrogram_utils import compute_stft, stft_to_magnitude_phase
-from src.spectrogram_utils import reconstruct_signal
+from src.io_utils import get_call_by_selection, load_audio, load_mapping_csv
+from src.spectrogram_utils import crop_audio
 
 
 APP_DIR = Path(__file__).resolve().parent
-MAPPING_CSV = APP_DIR / "outputs" / "audio_spectrogram_mapping.csv"
-RAW_AUDIO_DIR = APP_DIR / "data" / "raw_audio"
-SPECTROGRAM_REFS_DIR = APP_DIR / "data" / "spectrogram_refs"
-DEMO_OUTPUT_DIR = APP_DIR / "outputs" / "streamlit_demo"
-ORIGINAL_AUDIO_DIR = DEMO_OUTPUT_DIR / "original_audio"
-CLEANED_AUDIO_DIR = DEMO_OUTPUT_DIR / "cleaned_audio"
-PLOTS_DIR = DEMO_OUTPUT_DIR / "plots"
+OUTPUTS_DIR = APP_DIR / "outputs"
+CLEANED_AUDIO_DIR = OUTPUTS_DIR / "cleaned_audio"
+PLOTS_DIR = OUTPUTS_DIR / "plots"
 
-SPECTROGRAM_VIEW_OPTIONS = {
-    "heatmap": "Heatmap",
-    "contour": "Contour Map",
-    "perspective_3d": "3D Perspective Diagram",
+NOISE_MODE_ORDER = ("pre", "post", "both")
+NOISE_MODE_LABELS = {
+    "pre": "Pre-Noise Cleanup",
+    "post": "Post-Noise Cleanup",
+    "both": "Combined Cleanup",
+}
+NOISE_MODE_COPY = {
+    "pre": "Noise is estimated only from the audio just before the annotated call.",
+    "post": "Noise is estimated only from the audio just after the annotated call.",
+    "both": "Noise is estimated from both sides of the call and blended into one profile.",
+}
+PREFERRED_SELECTION = 1
+WAVE_PERSPECTIVES = {
+    "isometric": {"label": "Isometric", "elev": 30, "azim": -61},
+    "front_arc": {"label": "Front Arc", "elev": 18, "azim": -95},
+    "side_scan": {"label": "Side Scan", "elev": 13, "azim": -18},
+    "top_map": {"label": "Top Map", "elev": 84, "azim": -90},
 }
 
-CAMERA_PRESET_OPTIONS = {
-    "front_high": {"label": "Front High", "elev": 29, "azim": -92, "focal_length": 0.80},
-    "front_low": {"label": "Front Low", "elev": 13, "azim": -94, "focal_length": 0.76},
-    "diagonal": {"label": "Diagonal", "elev": 21, "azim": -68, "focal_length": 0.78},
-    "side_low": {"label": "Side Low", "elev": 11, "azim": -19, "focal_length": 0.77},
-    "side_high": {"label": "Side High", "elev": 27, "azim": -18, "focal_length": 0.80},
-}
-DEFAULT_CAMERA_PRESET = "diagonal"
-AUTO_CAMERA_CYCLE_SECONDS = 2.4
-
+AUDIO_FILE_PATTERN = re.compile(
+    r"^(?P<sound_stem>.+)_selection_(?P<selection>\d+)_(?P<mode>pre|post|both)_cleaned\.wav$"
+)
+PLOT_FILE_PATTERN = re.compile(
+    r"^(?P<sound_stem>.+)_selection_(?P<selection>\d+)_(?P<mode>pre|post|both)_(?P<plot_kind>before|after|comparison|noise_profile)\.png$"
+)
 
 st.set_page_config(
     page_title="Elephant Noise Cleanup",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
+
+
+@dataclass(frozen=True)
+class ModeArtifacts:
+    mode: str
+    audio_path: Path
+    before_plot_path: Path
+    after_plot_path: Path
+    comparison_plot_path: Path
+    noise_profile_plot_path: Path
+
+
+@dataclass(frozen=True)
+class DemoExample:
+    selection: int
+    sound_file: str
+    sound_stem: str
+    call_type: str
+    start_time: float
+    end_time: float
+    crop_start: float
+    crop_end: float
+    source_audio_path: Path
+    reference_spectrogram_path: Optional[Path]
+    original_before_plot_path: Path
+    original_audio_bytes: bytes
+    modes: Dict[str, ModeArtifacts]
+    available_group_count: int
 
 
 def inject_styles() -> None:
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@500;700&display=swap');
+
         :root {
-            --ink: #101813;
-            --muted: #38453d;
-            --forest: #203c34;
-            --moss: #6d8b65;
-            --sand: #efe4d2;
-            --clay: #b56b45;
-            --surface: rgba(255, 250, 241, 0.78);
-            --surface-strong: rgba(255, 250, 241, 0.95);
-            --line: rgba(32, 60, 52, 0.12);
+            --bg: #06131f;
+            --bg-2: #0b1c2b;
+            --bg-3: #11283d;
+            --ink: #e8f6ff;
+            --muted: #8ba6bb;
+            --accent: #6df7ff;
+            --accent-2: #5c8cff;
+            --accent-3: #9a7bff;
+            --surface: rgba(10, 22, 36, 0.76);
+            --surface-strong: rgba(15, 30, 48, 0.92);
+            --line: rgba(109, 247, 255, 0.16);
+            --glow: 0 0 0 1px rgba(109, 247, 255, 0.08), 0 18px 48px rgba(0, 0, 0, 0.28);
         }
 
         .stApp {
             background:
-                radial-gradient(circle at top right, rgba(181, 107, 69, 0.18), transparent 28%),
-                radial-gradient(circle at top left, rgba(109, 139, 101, 0.20), transparent 34%),
-                linear-gradient(180deg, #fbf5ea 0%, #f4ecdd 55%, #ebe2d3 100%);
+                radial-gradient(circle at 14% 18%, rgba(109, 247, 255, 0.18), transparent 24%),
+                radial-gradient(circle at 82% 12%, rgba(154, 123, 255, 0.20), transparent 26%),
+                radial-gradient(circle at 76% 78%, rgba(92, 140, 255, 0.18), transparent 24%),
+                linear-gradient(160deg, var(--bg) 0%, var(--bg-2) 48%, var(--bg-3) 100%);
             color: var(--ink);
+            font-family: "Space Grotesk", sans-serif;
+        }
+
+        .block-container {
+            padding-top: 2.2rem;
+            padding-bottom: 2rem;
+            max-width: 1320px;
+        }
+
+        [data-testid="stSidebar"] {
+            display: none;
         }
 
         [data-testid="stAppViewContainer"] p,
@@ -83,10 +132,10 @@ def inject_styles() -> None:
         [data-testid="stAppViewContainer"] label,
         [data-testid="stAppViewContainer"] .stMarkdown,
         [data-testid="stAppViewContainer"] .stMarkdown *,
-        [data-testid="stAppViewContainer"] [data-testid="stTable"] *,
         [data-testid="stAppViewContainer"] [data-testid="stMetricValue"],
         [data-testid="stAppViewContainer"] [data-testid="stMetricLabel"] {
             color: var(--ink) !important;
+            font-family: "Space Grotesk", sans-serif;
         }
 
         [data-testid="stAppViewContainer"] .stCaption,
@@ -94,150 +143,209 @@ def inject_styles() -> None:
             color: var(--muted) !important;
         }
 
-        [data-testid="stSidebar"] > div:first-child {
-            background:
-                linear-gradient(180deg, rgba(32, 60, 52, 0.98), rgba(43, 73, 63, 0.96));
-            border-right: 1px solid rgba(255, 255, 255, 0.08);
-        }
-
-        [data-testid="stSidebar"] * {
-            color: #f6f0e6;
-        }
-
-        [data-testid="stSidebar"] .stSelectbox label,
-        [data-testid="stSidebar"] .stMarkdown,
-        [data-testid="stSidebar"] .stCaption {
-            color: #f6f0e6 !important;
-        }
-
-        .block-container {
-            padding-top: 2.2rem;
-            padding-bottom: 2rem;
-        }
-
         .hero {
-            background: linear-gradient(135deg, rgba(255, 250, 241, 0.92), rgba(250, 239, 220, 0.84));
+            position: relative;
+            overflow: hidden;
+            background:
+                radial-gradient(circle at top left, rgba(109, 247, 255, 0.18), transparent 28%),
+                radial-gradient(circle at bottom right, rgba(154, 123, 255, 0.14), transparent 32%),
+                linear-gradient(145deg, rgba(13, 27, 43, 0.94), rgba(9, 18, 31, 0.88));
             border: 1px solid var(--line);
-            border-radius: 28px;
-            padding: 2rem 2rem 1.6rem 2rem;
-            box-shadow: 0 24px 60px rgba(42, 53, 47, 0.10);
-            margin-bottom: 1.2rem;
+            border-radius: 30px;
+            padding: 2.2rem 2.2rem 1.8rem 2.2rem;
+            box-shadow: var(--glow);
+            margin-bottom: 1.4rem;
+            backdrop-filter: blur(18px);
+        }
+
+        .hero::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(90deg, transparent 0%, rgba(109, 247, 255, 0.08) 48%, transparent 100%);
+            transform: translateX(-100%);
+            animation: hero-scan 8s linear infinite;
+            pointer-events: none;
+        }
+
+        @keyframes hero-scan {
+            to {
+                transform: translateX(100%);
+            }
         }
 
         .hero-kicker {
             display: inline-block;
             margin: 0 0 0.8rem 0;
-            padding: 0.3rem 0.7rem;
+            padding: 0.34rem 0.78rem;
             border-radius: 999px;
-            background: rgba(32, 60, 52, 0.08);
-            color: var(--forest);
+            background: rgba(109, 247, 255, 0.10);
+            color: var(--accent);
             font-size: 0.76rem;
             font-weight: 700;
-            letter-spacing: 0.08em;
+            letter-spacing: 0.14em;
             text-transform: uppercase;
+            border: 1px solid rgba(109, 247, 255, 0.18);
+            box-shadow: inset 0 0 22px rgba(109, 247, 255, 0.06);
         }
 
         .hero h1 {
             margin: 0 0 0.5rem 0;
-            font-size: 2.5rem;
+            font-size: clamp(2.5rem, 4vw, 4.3rem);
             line-height: 1.05;
             color: var(--ink);
+            letter-spacing: -0.04em;
         }
 
         .hero p {
             margin: 0;
-            max-width: 52rem;
-            font-size: 1rem;
-            line-height: 1.65;
+            max-width: 54rem;
+            font-size: 1.02rem;
+            line-height: 1.75;
             color: var(--muted);
         }
 
         .info-chip {
-            background: rgba(255, 250, 241, 0.85);
+            background: linear-gradient(145deg, rgba(12, 27, 42, 0.88), rgba(8, 18, 31, 0.84));
             border: 1px solid var(--line);
-            color: var(--forest);
+            color: var(--ink);
             border-radius: 18px;
-            padding: 0.9rem 1rem;
-            margin-bottom: 1rem;
+            padding: 1rem 1.08rem;
+            margin-bottom: 1.1rem;
             font-size: 0.94rem;
+            line-height: 1.6;
+            box-shadow: var(--glow);
+            backdrop-filter: blur(18px);
         }
 
         .info-chip strong {
-            color: var(--forest);
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        .section-title {
+            margin: 1.4rem 0 0.4rem 0;
+            color: var(--ink);
+            font-size: 1.42rem;
+            letter-spacing: -0.03em;
+        }
+
+        .section-copy {
+            margin: 0 0 1rem 0;
+            color: var(--muted);
+            font-size: 0.97rem;
+            line-height: 1.72;
+        }
+
+        .mode-pill {
+            display: inline-block;
+            padding: 0.3rem 0.78rem;
+            border-radius: 999px;
+            background: linear-gradient(90deg, rgba(109, 247, 255, 0.16), rgba(92, 140, 255, 0.14));
+            color: var(--accent);
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin-bottom: 0.6rem;
+            border: 1px solid rgba(109, 247, 255, 0.18);
         }
 
         div[data-testid="metric-container"] {
-            background: var(--surface);
+            background: linear-gradient(160deg, rgba(14, 28, 45, 0.86), rgba(8, 19, 31, 0.84));
             border: 1px solid var(--line);
             padding: 1rem 1rem 0.8rem 1rem;
             border-radius: 22px;
-            box-shadow: 0 14px 36px rgba(42, 53, 47, 0.06);
+            box-shadow: var(--glow);
+            backdrop-filter: blur(16px);
         }
 
         div[data-testid="metric-container"] label {
             color: var(--muted) !important;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.7rem !important;
         }
 
-        [data-testid="stTable"] table {
-            color: var(--ink);
+        div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+            color: var(--ink) !important;
+            font-size: 1.28rem !important;
         }
 
-        [data-testid="stTable"] th {
-            color: var(--forest);
-        }
-
-        .panel-title {
-            margin: 0 0 0.6rem 0;
-            color: var(--ink);
-            font-size: 1.15rem;
-        }
-
-        .panel-copy {
-            margin: 0 0 1rem 0;
-            color: var(--muted);
-            font-size: 0.95rem;
-            line-height: 1.5;
+        [data-testid="stImage"] img {
+            border-radius: 20px;
+            border: 1px solid var(--line);
+            box-shadow: var(--glow);
         }
 
         .empty-panel {
-            background: rgba(255, 250, 241, 0.70);
-            border: 1px dashed rgba(32, 60, 52, 0.25);
+            background: rgba(9, 20, 33, 0.72);
+            border: 1px dashed rgba(109, 247, 255, 0.24);
             border-radius: 24px;
             padding: 1.4rem;
             color: var(--muted);
         }
 
-        .stButton > button {
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.35rem;
+            margin-bottom: 0.8rem;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            background: rgba(14, 28, 45, 0.72);
+            border: 1px solid var(--line);
             border-radius: 999px;
-            border: none;
-            background: linear-gradient(135deg, #1f4037, #39594b);
-            color: #fffaf0;
-            font-weight: 700;
-            min-height: 3rem;
-            padding: 0.6rem 1.4rem;
-            box-shadow: 0 16px 28px rgba(31, 64, 55, 0.22);
+            padding: 0.55rem 0.95rem;
+            color: var(--muted);
+            transition: all 180ms ease;
         }
 
-        .stButton > button:hover {
-            background: linear-gradient(135deg, #18352d, #2f4d41);
+        .stTabs [data-baseweb="tab"]:hover {
+            border-color: rgba(109, 247, 255, 0.34);
+            color: var(--ink);
         }
 
-        [data-testid="stImage"] img {
-            border-radius: 18px;
-            border: 1px solid var(--line);
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(90deg, rgba(109, 247, 255, 0.18), rgba(92, 140, 255, 0.18)) !important;
+            color: var(--ink) !important;
+            box-shadow: inset 0 0 18px rgba(109, 247, 255, 0.08);
         }
 
-        .stAudio {
-            background: var(--surface-strong);
-            border: 1px solid var(--line);
-            border-radius: 18px;
-            padding: 0.35rem 0.45rem;
+        .stDivider {
+            opacity: 0.32;
         }
 
         .stExpander {
-            background: rgba(255, 250, 241, 0.75);
+            background: rgba(12, 26, 41, 0.74);
             border: 1px solid var(--line);
             border-radius: 18px;
+            box-shadow: var(--glow);
+        }
+
+        .stTable table {
+            background: transparent;
+        }
+
+        .stTable th {
+            color: var(--accent) !important;
+            background: rgba(109, 247, 255, 0.06);
+        }
+
+        .stTable td {
+            color: var(--ink) !important;
+            border-color: rgba(109, 247, 255, 0.08) !important;
+        }
+
+        code {
+            color: var(--accent);
+            font-family: "JetBrains Mono", monospace;
+        }
+
+        @media (max-width: 900px) {
+            .hero {
+                padding: 1.6rem 1.25rem 1.35rem 1.25rem;
+            }
         }
         </style>
         """,
@@ -245,397 +353,159 @@ def inject_styles() -> None:
     )
 
 
-def output_stem(selection_id: int) -> str:
-    return f"selection_{selection_id:03d}"
-
-
-def ensure_output_dirs() -> None:
-    for directory in (ORIGINAL_AUDIO_DIR, CLEANED_AUDIO_DIR, PLOTS_DIR):
-        directory.mkdir(parents=True, exist_ok=True)
-
-
-def normalize_audio(signal: np.ndarray) -> np.ndarray:
-    signal = np.asarray(signal, dtype=np.float32)
-    peak = float(np.max(np.abs(signal))) if signal.size else 0.0
-    if peak > 1.0:
-        signal = 0.98 * signal / peak
-    return signal
+def to_audio_bytes(signal, sample_rate: int) -> bytes:
+    buffer = io.BytesIO()
+    sf.write(buffer, signal, sample_rate, format="WAV")
+    buffer.seek(0)
+    return buffer.read()
 
 
 def to_mono(signal: np.ndarray) -> np.ndarray:
-    if np.ndim(signal) == 1:
-        return np.asarray(signal, dtype=np.float32)
-    return np.asarray(signal, dtype=np.float32).mean(axis=1)
-
-
-def resolve_audio_path(row: pd.Series) -> Optional[Path]:
-    candidates = [RAW_AUDIO_DIR / str(row["Sound_file"])]
-    if pd.notna(row.get("audio_path")):
-        candidates.append(Path(str(row["audio_path"])))
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def resolve_reference_spectrogram(row: pd.Series) -> Optional[Path]:
-    candidates = []
-    if pd.notna(row.get("expected_spectrogram")):
-        candidates.append(SPECTROGRAM_REFS_DIR / str(row["expected_spectrogram"]))
-    if pd.notna(row.get("spectrogram_path")):
-        candidates.append(Path(str(row["spectrogram_path"])))
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
+    array = np.asarray(signal, dtype=np.float32)
+    if array.ndim == 1:
+        return array
+    return array.mean(axis=1)
 
 
 @st.cache_data(show_spinner=False)
-def load_mapping() -> pd.DataFrame:
-    if not MAPPING_CSV.exists():
-        raise FileNotFoundError(f"Missing mapping CSV: {MAPPING_CSV}")
-
-    df = pd.read_csv(MAPPING_CSV).copy()
-    if df.empty:
-        return df
-
-    df["Selection"] = pd.to_numeric(df["Selection"], errors="coerce").astype("Int64")
-    df["Start_time"] = pd.to_numeric(df["Start_time"], errors="coerce")
-    df["End_time"] = pd.to_numeric(df["End_time"], errors="coerce")
-    df["duration_seconds"] = (df["End_time"] - df["Start_time"]).clip(lower=0)
-    df["resolved_audio_path"] = df.apply(resolve_audio_path, axis=1)
-    df["resolved_reference_spectrogram"] = df.apply(resolve_reference_spectrogram, axis=1)
-    df["has_audio"] = df["resolved_audio_path"].notna()
-    df["has_reference_spectrogram"] = df["resolved_reference_spectrogram"].notna()
-
-    valid_df = df[df["has_audio"] & df["has_reference_spectrogram"]].copy()
-    valid_df = valid_df.dropna(subset=["Selection", "Start_time", "End_time"])
-    valid_df["Selection"] = valid_df["Selection"].astype(int)
-    return valid_df.sort_values(["Call_type", "Sound_file", "Selection"]).reset_index(drop=True)
-
-
-def selection_label(row: pd.Series) -> str:
-    return (
-        f"Selection {int(row['Selection'])} | {row['Call_type']} | "
-        f"{row['Sound_file']} | {row['Start_time']:.2f}s to {row['End_time']:.2f}s"
-    )
-
-
-def save_spectrogram_image(
-    magnitude: np.ndarray,
-    sample_rate: int,
-    save_path: Path,
-    title: str,
-) -> Path:
-    db = librosa.amplitude_to_db(np.maximum(magnitude, 1e-10), ref=np.max)
-    duration = magnitude.shape[1] * config.HOP_LENGTH / sample_rate
-
-    fig, ax = plt.subplots(figsize=(8.4, 4.6))
-    img = ax.imshow(
-        db,
-        aspect="auto",
-        origin="lower",
-        cmap="magma",
-        extent=[0, duration, 0, sample_rate / 2],
-    )
-    ax.set_title(title)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Frequency (Hz)")
-    colorbar = fig.colorbar(img, ax=ax, pad=0.02)
-    colorbar.set_label("dB")
-    fig.tight_layout()
-
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    return save_path
-
-
-def build_spectrogram_figure(
-    magnitude: np.ndarray,
-    sample_rate: int,
-    title: str,
-    view_mode: str,
-    camera_preset: str = DEFAULT_CAMERA_PRESET,
-) -> plt.Figure:
-    db = librosa.amplitude_to_db(np.maximum(magnitude, 1e-10), ref=np.max)
-    duration = magnitude.shape[1] * config.HOP_LENGTH / sample_rate
-    times = np.linspace(0, duration, magnitude.shape[1])
-    freqs = np.linspace(0, sample_rate / 2, magnitude.shape[0])
-
-    if view_mode == "contour":
-        fig, ax = plt.subplots(figsize=(8.4, 4.6))
-        contour = ax.contourf(times, freqs, db, levels=24, cmap="viridis")
-        ax.set_title(title)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Frequency (Hz)")
-        colorbar = fig.colorbar(contour, ax=ax, pad=0.02)
-        colorbar.set_label("dB")
-        fig.tight_layout()
-        return fig
-
-    if view_mode == "perspective_3d":
-        camera_settings = CAMERA_PRESET_OPTIONS.get(
-            camera_preset,
-            CAMERA_PRESET_OPTIONS[DEFAULT_CAMERA_PRESET],
-        )
-        max_time_bins = min(18, magnitude.shape[1])
-        max_freq_bins = min(220, magnitude.shape[0])
-        time_idx = np.linspace(0, magnitude.shape[1] - 1, max_time_bins, dtype=int)
-        freq_idx = np.linspace(0, magnitude.shape[0] - 1, max_freq_bins, dtype=int)
-        times_sub = times[time_idx]
-        layer_positions = np.linspace(0, duration * 0.58, max_time_bins)
-        freqs_sub = freqs[freq_idx]
-        z_floor = float(np.percentile(db, 10) - 4.0)
-        z_ceiling = float(np.percentile(db, 99.6))
-
-        verts = []
-        ridge_lines = []
-        facecolors = []
-        edgecolors = []
-
-        smoothing_kernel = np.array([1, 2, 3, 2, 1], dtype=np.float32)
-        smoothing_kernel /= smoothing_kernel.sum()
-
-        for layer_index, time_bin in enumerate(time_idx):
-            ridge = db[freq_idx, time_bin]
-            ridge = np.convolve(ridge, smoothing_kernel, mode="same")
-            ridge = z_floor + (ridge - z_floor) * 1.24
-            ridge = np.clip(ridge, z_floor, z_ceiling)
-
-            ridge_points = list(zip(freqs_sub, ridge))
-            polygon = [(freqs_sub[0], z_floor), *ridge_points, (freqs_sub[-1], z_floor)]
-            verts.append(polygon)
-            ridge_lines.append(ridge)
-
-            fade = layer_index / max(1, len(time_idx) - 1)
-            facecolors.append((0.92, 0.94, 0.98, 0.22 + (1.0 - fade) * 0.34))
-            edgecolors.append((1.0, 1.0, 1.0, 0.22 + (1.0 - fade) * 0.30))
-
-        fig = plt.figure(figsize=(9.2, 5.9))
-        fig.patch.set_facecolor("#101317")
-        ax = fig.add_subplot(111, projection="3d")
-        ax.set_facecolor("#101317")
-
-        collection = PolyCollection(
-            verts,
-            facecolors=facecolors,
-            edgecolors=edgecolors,
-            linewidths=1.0,
-        )
-        ax.add_collection3d(collection, zs=layer_positions, zdir="y")
-
-        for layer_y, ridge, fade in zip(layer_positions, ridge_lines, np.linspace(1.0, 0.35, len(ridge_lines))):
-            ax.plot(
-                freqs_sub,
-                np.full_like(freqs_sub, layer_y),
-                ridge,
-                color=(1.0, 1.0, 1.0, 0.16 + 0.42 * fade),
-                linewidth=1.35,
-            )
-
-        x_min = float(freqs_sub.min())
-        x_max = float(freqs_sub.max())
-        y_min = float(layer_positions.min())
-        y_max = float(layer_positions.max())
-        x_span = x_max - x_min
-        y_span = max(y_max - y_min, 1e-6)
-
-        ax.set_xlim(x_min - 0.015 * x_span, x_max + 0.01 * x_span)
-        ax.set_ylim(y_min - 0.03 * y_span, y_max + 0.02 * y_span)
-        ax.set_zlim(z_floor, z_ceiling)
-        ax.set_title(title, color="#f4f6f8", pad=18, fontsize=13)
-        ax.set_xlabel("Frequency (Hz)", labelpad=10, color="#d7dde3")
-        ax.set_ylabel("Time (s)", labelpad=10, color="#d7dde3")
-        ax.set_zlabel("Intensity (dB)", labelpad=8, color="#d7dde3")
-        ax.view_init(
-            elev=camera_settings["elev"],
-            azim=camera_settings["azim"],
-        )
-        try:
-            ax.set_proj_type("persp", focal_length=camera_settings["focal_length"])
-        except TypeError:
-            ax.set_proj_type("persp")
-        ax.set_box_aspect((2.35, 0.92, 0.78))
-
-        ax.xaxis._axinfo["grid"]["color"] = (0.42, 0.46, 0.50, 0.42)
-        ax.yaxis._axinfo["grid"]["color"] = (0.42, 0.46, 0.50, 0.35)
-        ax.zaxis._axinfo["grid"]["color"] = (0.30, 0.34, 0.38, 0.16)
-        ax.xaxis._axinfo["tick"]["color"] = (0.84, 0.88, 0.91, 0.95)
-        ax.yaxis._axinfo["tick"]["color"] = (0.84, 0.88, 0.91, 0.95)
-        ax.zaxis._axinfo["tick"]["color"] = (0.84, 0.88, 0.91, 0.95)
-
-        ax.xaxis.set_pane_color((0.08, 0.10, 0.12, 0.78))
-        ax.yaxis.set_pane_color((0.08, 0.10, 0.12, 0.24))
-        ax.zaxis.set_pane_color((0.08, 0.10, 0.12, 0.0))
-
-        x_ticks = np.linspace(freqs_sub.min(), freqs_sub.max(), 8)
-        y_ticks = np.linspace(layer_positions.min(), layer_positions.max(), 4)
-        z_ticks = np.linspace(z_floor, z_ceiling, 4)
-        ax.set_xticks(x_ticks)
-        ax.set_yticks(y_ticks)
-        ax.set_zticks(z_ticks)
-        ax.set_xticklabels([f"{tick:.0f}" for tick in x_ticks], rotation=0, ha="center")
-        ax.set_yticklabels([f"{tick:.1f}" for tick in np.linspace(times_sub.min(), times_sub.max(), 4)])
-        ax.tick_params(colors="#d7dde3", labelsize=9, pad=2)
-
-        ax.xaxis.line.set_color((0.72, 0.76, 0.80, 0.62))
-        ax.yaxis.line.set_color((0.72, 0.76, 0.80, 0.50))
-        ax.zaxis.line.set_color((0.50, 0.58, 0.64, 0.18))
-
-        fig.tight_layout()
-        return fig
-
-    fig, ax = plt.subplots(figsize=(8.4, 4.6))
-    image = ax.imshow(
-        db,
-        aspect="auto",
-        origin="lower",
-        cmap="magma",
-        extent=[0, duration, 0, sample_rate / 2],
-    )
-    ax.set_title(title)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Frequency (Hz)")
-    colorbar = fig.colorbar(image, ax=ax, pad=0.02)
-    colorbar.set_label("dB")
-    fig.tight_layout()
-    return fig
-
-
-def load_clip_from_selection(row: pd.Series) -> Tuple[np.ndarray, int]:
-    audio_path = Path(row["resolved_audio_path"])
-    signal, sample_rate = load_audio(str(audio_path), sample_rate=config.SAMPLE_RATE)
+def load_waveform_signal(audio_path: str) -> Tuple[np.ndarray, int]:
+    signal, sample_rate = sf.read(audio_path)
     signal = to_mono(signal)
+    peak = float(np.max(np.abs(signal))) if signal.size else 0.0
+    if peak > 0:
+        signal = signal / peak
+    return signal.astype(np.float32), int(sample_rate)
 
-    start_sample = max(0, int(float(row["Start_time"]) * sample_rate))
-    end_sample = min(len(signal), int(float(row["End_time"]) * sample_rate))
-    if end_sample <= start_sample:
-        raise ValueError(
-            f"Selection {int(row['Selection'])} produced an empty clip. "
-            "Check the mapping timestamps."
+
+def build_wave_layers(signal: np.ndarray, sample_rate: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    max_points = 2200
+    if signal.size > max_points:
+        sample_index = np.linspace(0, signal.size - 1, max_points, dtype=int)
+        signal = signal[sample_index]
+
+    times = np.linspace(0, len(signal) / sample_rate, len(signal), dtype=np.float32)
+
+    segments = 16
+    edges = np.linspace(0, len(signal), segments + 1, dtype=int)
+    smoothing_kernel = np.array([1, 2, 3, 2, 1], dtype=np.float32)
+    smoothing_kernel /= smoothing_kernel.sum()
+
+    layer_positions = np.linspace(0.0, max(times[-1] * 0.68, 0.8), segments, dtype=np.float32)
+    layered_wave = []
+    for index in range(segments):
+        start = edges[index]
+        end = max(start + 1, edges[index + 1])
+        segment = signal[start:end]
+        smoothed = np.convolve(segment, smoothing_kernel, mode="same")
+        interp_positions = np.linspace(0, len(smoothed) - 1, len(times))
+        source_positions = np.arange(len(smoothed))
+        layer = np.interp(interp_positions, source_positions, smoothed)
+        fade = 1.0 - (index / max(1, segments - 1)) * 0.72
+        layered_wave.append(layer * fade)
+
+    return times, layer_positions, np.asarray(layered_wave, dtype=np.float32)
+
+
+def build_wave_model_figure(audio_path: str, perspective_key: str) -> plt.Figure:
+    signal, sample_rate = load_waveform_signal(audio_path)
+    times, layer_positions, layered_wave = build_wave_layers(signal, sample_rate)
+
+    z_floor = -0.25
+    verts = []
+    facecolors = []
+    ridge_colors = []
+
+    for index, layer in enumerate(layered_wave):
+        ridge_points = list(zip(times, layer))
+        polygon = [(times[0], z_floor), *ridge_points, (times[-1], z_floor)]
+        verts.append(polygon)
+
+        glow_strength = 1.0 - (index / max(1, len(layered_wave) - 1)) * 0.65
+        facecolors.append((0.08, 0.92, 0.98, 0.08 + 0.18 * glow_strength))
+        ridge_colors.append((0.49, 0.97, 1.0, 0.18 + 0.50 * glow_strength))
+
+    figure = plt.figure(figsize=(10.6, 5.6))
+    figure.patch.set_facecolor("#07111c")
+    axis = figure.add_subplot(111, projection="3d")
+    axis.set_facecolor("#07111c")
+
+    collection = PolyCollection(
+        verts,
+        facecolors=facecolors,
+        edgecolors=(0.43, 0.97, 1.0, 0.04),
+        linewidths=0.6,
+    )
+    axis.add_collection3d(collection, zs=layer_positions, zdir="y")
+
+    for y_position, layer, ridge_color in zip(layer_positions, layered_wave, ridge_colors):
+        axis.plot(
+            times,
+            np.full_like(times, y_position),
+            layer,
+            color=ridge_color,
+            linewidth=1.2,
         )
 
-    clip = signal[start_sample:end_sample]
-    if clip.size == 0:
-        raise ValueError(
-            f"Selection {int(row['Selection'])} produced an empty clip. "
-            "Check the mapping timestamps."
-        )
-
-    return normalize_audio(clip), sample_rate
-
-
-def prepare_original_assets(row: pd.Series) -> Dict[str, object]:
-    ensure_output_dirs()
-    selection_id = int(row["Selection"])
-    stem = output_stem(selection_id)
-    original_audio_path = ORIGINAL_AUDIO_DIR / f"{stem}_original.wav"
-    original_spectrogram_path = PLOTS_DIR / f"{stem}_original.png"
-
-    clip, sample_rate = load_clip_from_selection(row)
-    original_stft = compute_stft(
-        clip,
-        n_fft=config.N_FFT,
-        hop_length=config.HOP_LENGTH,
-    )
-    original_magnitude, _ = stft_to_magnitude_phase(original_stft)
-
-    if not original_audio_path.exists():
-        save_audio(str(original_audio_path), clip, sample_rate)
-    if not original_spectrogram_path.exists():
-        save_spectrogram_image(
-            magnitude=original_magnitude,
-            sample_rate=sample_rate,
-            save_path=original_spectrogram_path,
-            title=f"Original spectrogram | Selection {selection_id}",
-        )
-
-    return {
-        "original_audio_path": original_audio_path,
-        "original_spectrogram_path": original_spectrogram_path,
-        "original_magnitude": original_magnitude,
-        "sample_rate": sample_rate,
-    }
-
-
-def process_call(row: pd.Series) -> dict[str, object]:
-    ensure_output_dirs()
-    selection_id = int(row["Selection"])
-    stem = output_stem(selection_id)
-
-    preview_assets = prepare_original_assets(row)
-    clip, sample_rate = load_clip_from_selection(row)
-
-    stft_matrix = compute_stft(
-        clip,
-        n_fft=config.N_FFT,
-        hop_length=config.HOP_LENGTH,
-    )
-    magnitude, phase = stft_to_magnitude_phase(stft_matrix)
-
-    noise_profile = estimate_noise_profile(
-        magnitude,
-        percentile=config.NOISE_PERCENTILE,
-    )
-    noise_profile = smooth_noise_profile(noise_profile)
-    cleaned_magnitude = spectral_subtraction(
-        magnitude,
-        noise_profile,
-        over_subtraction=config.OVER_SUBTRACTION_FACTOR,
-        spectral_floor=config.SPECTRAL_FLOOR,
+    base_projection = np.percentile(np.abs(layered_wave), 78, axis=0)
+    axis.plot(
+        times,
+        np.full_like(times, layer_positions[-1] + 0.06 * max(layer_positions[-1], 1.0)),
+        base_projection * 0.10 - 0.22,
+        color=(0.36, 0.56, 1.0, 0.30),
+        linewidth=1.1,
     )
 
-    cleaned_signal = reconstruct_signal(
-        cleaned_magnitude,
-        phase,
-        hop_length=config.HOP_LENGTH,
-    )
-    cleaned_signal = normalize_audio(cleaned_signal)
-    if len(cleaned_signal) < len(clip):
-        cleaned_signal = np.pad(cleaned_signal, (0, len(clip) - len(cleaned_signal)))
-    cleaned_signal = cleaned_signal[: len(clip)]
+    axis.set_xlim(float(times.min()), float(times.max()))
+    axis.set_ylim(float(layer_positions.min()) - 0.06, float(layer_positions.max()) + 0.09)
+    axis.set_zlim(z_floor, 1.05)
+    axis.set_box_aspect((2.9, 1.0, 0.9))
 
-    cleaned_audio_path = CLEANED_AUDIO_DIR / f"{stem}_cleaned.wav"
-    cleaned_spectrogram_path = PLOTS_DIR / f"{stem}_cleaned.png"
+    settings = WAVE_PERSPECTIVES[perspective_key]
+    axis.view_init(elev=settings["elev"], azim=settings["azim"])
 
-    save_audio(str(cleaned_audio_path), cleaned_signal, sample_rate)
-    save_spectrogram_image(
-        magnitude=cleaned_magnitude,
-        sample_rate=sample_rate,
-        save_path=cleaned_spectrogram_path,
-        title=f"Cleaned spectrogram | Selection {selection_id}",
-    )
+    try:
+        axis.set_proj_type("persp", focal_length=0.88)
+    except TypeError:
+        axis.set_proj_type("persp")
 
-    return {
-        "selection_id": selection_id,
-        "sample_rate": sample_rate,
-        "original_audio_path": preview_assets["original_audio_path"],
-        "original_spectrogram_path": preview_assets["original_spectrogram_path"],
-        "original_magnitude": preview_assets["original_magnitude"],
-        "cleaned_audio_path": cleaned_audio_path,
-        "cleaned_spectrogram_path": cleaned_spectrogram_path,
-        "cleaned_magnitude": cleaned_magnitude,
-        "reference_spectrogram_path": Path(row["resolved_reference_spectrogram"]),
-    }
+    axis.set_title("3D waveform model", color="#eaf8ff", pad=14, fontsize=13)
+    axis.set_xlabel("Time (s)", color="#93bdd0", labelpad=10)
+    axis.set_ylabel("Depth", color="#93bdd0", labelpad=10)
+    axis.set_zlabel("Amplitude", color="#93bdd0", labelpad=8)
+
+    axis.xaxis._axinfo["grid"]["color"] = (0.41, 0.83, 0.98, 0.14)
+    axis.yaxis._axinfo["grid"]["color"] = (0.41, 0.83, 0.98, 0.10)
+    axis.zaxis._axinfo["grid"]["color"] = (0.41, 0.83, 0.98, 0.08)
+
+    axis.xaxis._axinfo["tick"]["color"] = (0.85, 0.96, 1.0, 0.85)
+    axis.yaxis._axinfo["tick"]["color"] = (0.85, 0.96, 1.0, 0.55)
+    axis.zaxis._axinfo["tick"]["color"] = (0.85, 0.96, 1.0, 0.78)
+
+    axis.xaxis.set_pane_color((0.04, 0.08, 0.13, 0.90))
+    axis.yaxis.set_pane_color((0.05, 0.11, 0.18, 0.22))
+    axis.zaxis.set_pane_color((0.05, 0.11, 0.18, 0.04))
+
+    axis.tick_params(colors="#dff6ff", labelsize=8, pad=2)
+    axis.xaxis.line.set_color((0.41, 0.83, 0.98, 0.25))
+    axis.yaxis.line.set_color((0.41, 0.83, 0.98, 0.15))
+    axis.zaxis.line.set_color((0.41, 0.83, 0.98, 0.20))
+
+    figure.tight_layout()
+    return figure
 
 
-def audio_player(path: Path, label: str) -> None:
-    audio_base64 = base64.b64encode(path.read_bytes()).decode("ascii")
+def audio_player(audio_bytes: bytes, label: str, hint: str) -> None:
+    audio_base64 = base64.b64encode(audio_bytes).decode("ascii")
     safe_label = escape(label)
-    component_id = "".join(
-        char if char.isalnum() else "-"
-        for char in f"{path.stem}-{label}".lower()
-    )
+    safe_hint = escape(hint)
+    component_id = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "audio"
 
     components.html(
         f"""
         <div class="audio-card">
             <div class="audio-card__header">
                 <div class="audio-card__label">{safe_label}</div>
-                <div class="audio-card__hint">Press play to activate the live audio visualizer.</div>
+                <div class="audio-card__hint">{safe_hint}</div>
             </div>
             <canvas id="viz-{component_id}" width="720" height="120"></canvas>
             <audio id="audio-{component_id}" controls preload="metadata">
@@ -656,8 +526,8 @@ def audio_player(path: Path, label: str) -> None:
 
         function drawFrame(values, active) {{
             const background = context.createLinearGradient(0, 0, width, height);
-            background.addColorStop(0, active ? "#17352c" : "#edf1ea");
-            background.addColorStop(1, active ? "#315747" : "#dce4d7");
+            background.addColorStop(0, active ? "#081624" : "#0b1827");
+            background.addColorStop(1, active ? "#112c43" : "#132336");
             context.fillStyle = background;
             context.fillRect(0, 0, width, height);
 
@@ -667,7 +537,7 @@ def audio_player(path: Path, label: str) -> None:
                 const barHeight = Math.max(8, intensity * (height - 18));
                 const x = i * barWidth;
                 const y = height - barHeight;
-                context.fillStyle = active ? "#f5e6b3" : "#7d8f7d";
+                context.fillStyle = active ? "#72f7ff" : "#4d6780";
                 context.fillRect(x + 1.5, y, Math.max(2, barWidth - 3), barHeight);
             }}
         }}
@@ -730,16 +600,17 @@ def audio_player(path: Path, label: str) -> None:
         <style>
         body {{
             margin: 0;
-            font-family: "Segoe UI", sans-serif;
+            font-family: "Space Grotesk", "Segoe UI", sans-serif;
             background: transparent;
         }}
 
         .audio-card {{
-            background: rgba(255, 250, 241, 0.96);
-            border: 1px solid rgba(32, 60, 52, 0.14);
-            border-radius: 18px;
+            background: linear-gradient(145deg, rgba(12, 25, 40, 0.94), rgba(9, 18, 31, 0.92));
+            border: 1px solid rgba(109, 247, 255, 0.16);
+            border-radius: 20px;
             padding: 0.95rem 1rem 1rem 1rem;
-            box-shadow: 0 14px 34px rgba(42, 53, 47, 0.08);
+            box-shadow: 0 0 0 1px rgba(109, 247, 255, 0.05), 0 18px 44px rgba(0, 0, 0, 0.34);
+            backdrop-filter: blur(16px);
         }}
 
         .audio-card__header {{
@@ -747,14 +618,15 @@ def audio_player(path: Path, label: str) -> None:
         }}
 
         .audio-card__label {{
-            color: #122019;
+            color: #ecf8ff;
             font-size: 0.96rem;
             font-weight: 700;
             margin-bottom: 0.2rem;
+            letter-spacing: -0.02em;
         }}
 
         .audio-card__hint {{
-            color: #415045;
+            color: #90abc0;
             font-size: 0.83rem;
             line-height: 1.4;
         }}
@@ -767,9 +639,10 @@ def audio_player(path: Path, label: str) -> None:
             width: 100%;
             height: 120px;
             display: block;
-            border-radius: 14px;
+            border-radius: 16px;
             margin: 0.75rem 0 0.9rem 0;
-            border: 1px solid rgba(18, 32, 25, 0.10);
+            border: 1px solid rgba(109, 247, 255, 0.12);
+            box-shadow: inset 0 0 20px rgba(109, 247, 255, 0.04);
         }}
 
         audio {{
@@ -783,125 +656,277 @@ def audio_player(path: Path, label: str) -> None:
     )
 
 
-def render_panel(
-    title: str,
-    copy: str,
-    spectrogram_path: Optional[Path] = None,
-    spectrogram_magnitude: Optional[np.ndarray] = None,
-    spectrogram_sample_rate: Optional[int] = None,
-    spectrogram_view_mode: str = "heatmap",
-    camera_preset: str = DEFAULT_CAMERA_PRESET,
-    audio_path: Optional[Path] = None,
-    image_caption: Optional[str] = None,
-    audio_caption: Optional[str] = None,
-) -> None:
-    st.markdown(f"<h3 class='panel-title'>{title}</h3>", unsafe_allow_html=True)
-    st.markdown(f"<p class='panel-copy'>{copy}</p>", unsafe_allow_html=True)
+def truthy(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
 
-    if spectrogram_magnitude is not None and spectrogram_sample_rate is not None:
-        figure = build_spectrogram_figure(
-            magnitude=spectrogram_magnitude,
-            sample_rate=spectrogram_sample_rate,
-            title=f"{title} | {SPECTROGRAM_VIEW_OPTIONS.get(spectrogram_view_mode, 'Heatmap')}",
-            view_mode=spectrogram_view_mode,
-            camera_preset=camera_preset,
+
+def discover_output_groups() -> Dict[Tuple[str, int], dict]:
+    groups: Dict[Tuple[str, int], dict] = {}
+
+    for audio_path in sorted(CLEANED_AUDIO_DIR.glob("*_cleaned.wav")):
+        match = AUDIO_FILE_PATTERN.match(audio_path.name)
+        if not match:
+            continue
+
+        sound_stem = match.group("sound_stem")
+        selection = int(match.group("selection"))
+        mode = match.group("mode")
+        key = (sound_stem, selection)
+
+        bucket = groups.setdefault(
+            key,
+            {"sound_stem": sound_stem, "selection": selection, "audios": {}, "plots": {}},
         )
-        st.pyplot(figure, use_container_width=True)
-        plt.close(figure)
-        if image_caption:
-            st.caption(image_caption)
-    elif spectrogram_path and spectrogram_path.exists():
-        st.image(str(spectrogram_path), use_container_width=True)
-        if image_caption:
-            st.caption(image_caption)
-    else:
-        st.markdown(
-            "<div class='empty-panel'>No spectrogram is available yet.</div>",
-            unsafe_allow_html=True,
+        bucket["audios"][mode] = audio_path
+
+    for plot_path in sorted(PLOTS_DIR.glob("*.png")):
+        match = PLOT_FILE_PATTERN.match(plot_path.name)
+        if not match:
+            continue
+
+        sound_stem = match.group("sound_stem")
+        selection = int(match.group("selection"))
+        mode = match.group("mode")
+        plot_kind = match.group("plot_kind")
+        key = (sound_stem, selection)
+
+        bucket = groups.setdefault(
+            key,
+            {"sound_stem": sound_stem, "selection": selection, "audios": {}, "plots": {}},
+        )
+        bucket["plots"].setdefault(mode, {})[plot_kind] = plot_path
+
+    return groups
+
+
+def is_complete_group(group: dict) -> bool:
+    required_plot_kinds = {"before", "after", "comparison", "noise_profile"}
+
+    for mode in NOISE_MODE_ORDER:
+        if mode not in group["audios"]:
+            return False
+
+        mode_plots = group["plots"].get(mode, {})
+        if not required_plot_kinds.issubset(mode_plots.keys()):
+            return False
+
+    return True
+
+
+def choose_output_group(groups: Dict[Tuple[str, int], dict]) -> Tuple[dict, int]:
+    complete_groups = [group for group in groups.values() if is_complete_group(group)]
+    if not complete_groups:
+        raise FileNotFoundError(
+            "No complete output set was found. Expected three cleaned WAV files "
+            "and matching before/after/comparison/noise-profile plots."
         )
 
-    if audio_path and audio_path.exists():
-        audio_player(audio_path, audio_caption or "Audio")
-    else:
-        st.markdown(
-            "<div class='empty-panel'>Run cleaning to generate the audio preview.</div>",
-            unsafe_allow_html=True,
+    complete_groups.sort(
+        key=lambda group: (
+            0 if group["selection"] == PREFERRED_SELECTION else 1,
+            group["selection"],
+            group["sound_stem"],
+        )
+    )
+    return complete_groups[0], len(complete_groups)
+
+
+def resolve_reference_spectrogram(row: pd.Series) -> Optional[Path]:
+    if not truthy(row.get("spectrogram_exists", False)):
+        return None
+
+    candidate = Path(str(row["spectrogram_path"]))
+    return candidate if candidate.exists() else None
+
+
+@st.cache_data(show_spinner=False)
+def load_demo_example() -> DemoExample:
+    mapping_df = load_mapping_csv()
+    output_groups = discover_output_groups()
+    selected_group, complete_group_count = choose_output_group(output_groups)
+
+    selection = int(selected_group["selection"])
+    row = get_call_by_selection(selection, mapping_df)
+    sound_file = str(row["Sound_file"])
+    sound_stem = Path(sound_file).stem
+
+    if sound_stem != selected_group["sound_stem"]:
+        raise ValueError(
+            "The saved output filenames do not match the mapping CSV for the selected example."
         )
 
+    if not truthy(row.get("audio_exists", False)):
+        raise FileNotFoundError(
+            f"Mapped source audio is missing for selection {selection}: {row['audio_path']}"
+        )
 
-def render_selected_call_metadata(row: pd.Series) -> None:
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("Selection", f"#{int(row['Selection'])}")
-    metric_columns[1].metric("Call Type", str(row["Call_type"]).title())
-    metric_columns[2].metric("Clip Window", f"{row['Start_time']:.2f}s to {row['End_time']:.2f}s")
-    metric_columns[3].metric("Duration", f"{row['duration_seconds']:.2f}s")
+    source_audio_path = Path(str(row["audio_path"]))
+    if not source_audio_path.exists():
+        raise FileNotFoundError(f"Source audio file not found: {source_audio_path}")
+
+    signal, sample_rate = load_audio(source_audio_path)
+    start_time = float(row["Start_time"])
+    end_time = float(row["End_time"])
+    crop_start = max(0.0, start_time - config.CROP_BUFFER_SEC)
+    crop_end = end_time + config.CROP_BUFFER_SEC
+    cropped_signal = crop_audio(signal, sample_rate, crop_start, crop_end)
+    original_audio_bytes = to_audio_bytes(cropped_signal, sample_rate)
+
+    modes: Dict[str, ModeArtifacts] = {}
+    for mode in NOISE_MODE_ORDER:
+        mode_plots = selected_group["plots"][mode]
+        modes[mode] = ModeArtifacts(
+            mode=mode,
+            audio_path=selected_group["audios"][mode],
+            before_plot_path=mode_plots["before"],
+            after_plot_path=mode_plots["after"],
+            comparison_plot_path=mode_plots["comparison"],
+            noise_profile_plot_path=mode_plots["noise_profile"],
+        )
+
+    original_before_plot_path = modes["both"].before_plot_path
+
+    return DemoExample(
+        selection=selection,
+        sound_file=sound_file,
+        sound_stem=sound_stem,
+        call_type=str(row["Call_type"]),
+        start_time=start_time,
+        end_time=end_time,
+        crop_start=crop_start,
+        crop_end=crop_end,
+        source_audio_path=source_audio_path,
+        reference_spectrogram_path=resolve_reference_spectrogram(row),
+        original_before_plot_path=original_before_plot_path,
+        original_audio_bytes=original_audio_bytes,
+        modes=modes,
+        available_group_count=complete_group_count,
+    )
+
+
+def render_metadata(example: DemoExample) -> None:
+    metric_columns = st.columns(5)
+    metric_columns[0].metric("Selection", f"#{example.selection}")
+    metric_columns[1].metric("Call Type", example.call_type.title())
+    metric_columns[2].metric("Call Window", f"{example.start_time:.2f}s to {example.end_time:.2f}s")
+    metric_columns[3].metric("Crop Window", f"{example.crop_start:.2f}s to {example.crop_end:.2f}s")
+    metric_columns[4].metric("Cleaned Outputs", "3 modes")
+
+    extra_copy = ""
+    if example.available_group_count > 1:
+        extra_copy = (
+            f"<br>This UI is intentionally pinned to one example even though "
+            f"{example.available_group_count} complete output sets were found."
+        )
 
     st.markdown(
         f"""
         <div class="info-chip">
-            Selected file: <strong>{row['Sound_file']}</strong><br>
-            Demo outputs are written to <strong>{DEMO_OUTPUT_DIR}</strong>.
+            Showing only <strong>{example.sound_file}</strong> from the current pipeline outputs.<br>
+            Source audio: <strong>{example.source_audio_path}</strong><br>
+            Saved artifacts are read directly from <strong>{OUTPUTS_DIR}</strong>.
+            {extra_copy}
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.expander("Selection details", expanded=False):
-        details = pd.DataFrame(
-            [
-                ("Selection", int(row["Selection"])),
-                ("Call type", row["Call_type"]),
-                ("Sound file", row["Sound_file"]),
-                ("Start time (s)", f"{row['Start_time']:.4f}"),
-                ("End time (s)", f"{row['End_time']:.4f}"),
-                ("Duration (s)", f"{row['duration_seconds']:.4f}"),
-                ("Audio source", str(row["resolved_audio_path"])),
-                ("Reference spectrogram", str(row["resolved_reference_spectrogram"])),
-            ],
-            columns=["Field", "Value"],
+
+def render_original_section(example: DemoExample) -> None:
+    st.markdown("<h2 class='section-title'>Original Recording</h2>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <p class='section-copy'>
+            The original clip below uses the same buffered crop as the denoising pipeline,
+            so it lines up with the saved before and after spectrograms.
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    audio_player(
+        example.original_audio_bytes,
+        "Original cropped audio",
+        "Buffered source clip used as the input to the cleanup pipeline.",
+    )
+
+    preview_columns = st.columns(2, gap="large")
+    with preview_columns[0]:
+        st.image(str(example.original_before_plot_path), use_container_width=True)
+        st.caption("Pipeline spectrogram before cleaning")
+
+    with preview_columns[1]:
+        if example.reference_spectrogram_path is not None:
+            st.image(str(example.reference_spectrogram_path), use_container_width=True)
+            st.caption("Reference spectrogram linked from the mapping CSV")
+        else:
+            st.markdown(
+                "<div class='empty-panel'>No reference spectrogram was found for this selection.</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def render_mode_section(artifacts: ModeArtifacts) -> None:
+    st.markdown(
+        f"<div class='mode-pill'>{NOISE_MODE_LABELS[artifacts.mode]}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<h3 class='section-title' style='margin-top: 0;'>{NOISE_MODE_LABELS[artifacts.mode]}</h3>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<p class='section-copy'>{NOISE_MODE_COPY[artifacts.mode]}</p>",
+        unsafe_allow_html=True,
+    )
+
+    audio_player(
+        artifacts.audio_path.read_bytes(),
+        f"{NOISE_MODE_LABELS[artifacts.mode]} audio",
+        "Saved cleaned WAV generated by the new pipeline.",
+    )
+    plot_tabs = st.tabs(["Before", "After", "Comparison", "Noise Profile", "3D Wave"])
+    tab_items = [
+        ("Before cleaning", artifacts.before_plot_path, "Spectrogram before denoising for this mode."),
+        ("After cleaning", artifacts.after_plot_path, "Cleaned spectrogram produced by this mode."),
+        ("Before vs after", artifacts.comparison_plot_path, "Side-by-side comparison for quick review."),
+        ("Noise profile", artifacts.noise_profile_plot_path, "Estimated frequency-wise noise profile."),
+    ]
+
+    for tab, (_, image_path, caption) in zip(plot_tabs[:4], tab_items):
+        with tab:
+            st.image(str(image_path), use_container_width=True)
+            st.caption(caption)
+
+    with plot_tabs[4]:
+        selected_perspective = st.radio(
+            f"Wave model perspective for {artifacts.mode}",
+            options=list(WAVE_PERSPECTIVES.keys()),
+            format_func=lambda key: WAVE_PERSPECTIVES[key]["label"],
+            horizontal=True,
+            key=f"wave-perspective-{artifacts.mode}",
+            label_visibility="collapsed",
         )
-        st.table(details)
+        st.caption("Inspect the cleaned recording as a futuristic 3D waveform from multiple perspectives.")
 
+        wave_figure = build_wave_model_figure(str(artifacts.audio_path), selected_perspective)
+        st.pyplot(wave_figure, use_container_width=True)
+        plt.close(wave_figure)
 
-def render_sidebar(df: pd.DataFrame) -> pd.Series:
-    st.sidebar.markdown("## Explore Calls")
-    st.sidebar.caption(
-        "Filter by call type and source file, then choose a valid labeled example."
-    )
-
-    call_type_options = ["All call types"] + sorted(df["Call_type"].dropna().unique())
-    selected_call_type = st.sidebar.selectbox("Call type filter", call_type_options)
-
-    filtered_df = df.copy()
-    if selected_call_type != "All call types":
-        filtered_df = filtered_df[filtered_df["Call_type"] == selected_call_type]
-
-    sound_file_options = ["All sound files"] + sorted(filtered_df["Sound_file"].unique())
-    selected_sound_file = st.sidebar.selectbox("Sound file filter", sound_file_options)
-
-    if selected_sound_file != "All sound files":
-        filtered_df = filtered_df[filtered_df["Sound_file"] == selected_sound_file]
-
-    filtered_df = filtered_df.sort_values(["Sound_file", "Selection"]).reset_index(drop=True)
-    if filtered_df.empty:
-        raise ValueError("No valid selections match the current filters.")
-
-    selection_lookup = {
-        int(row["Selection"]): selection_label(row)
-        for _, row in filtered_df.iterrows()
-    }
-    selected_selection = st.sidebar.selectbox(
-        "Selection dropdown",
-        options=list(selection_lookup.keys()),
-        format_func=lambda selection_id: selection_lookup[selection_id],
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.caption(
-        f"{len(filtered_df)} selections across {filtered_df['Sound_file'].nunique()} files."
-    )
-
-    return filtered_df[filtered_df["Selection"] == selected_selection].iloc[0]
+    with st.expander("Saved files", expanded=False):
+        files_df = pd.DataFrame(
+            [
+                ("Cleaned audio", str(artifacts.audio_path)),
+                ("Before plot", str(artifacts.before_plot_path)),
+                ("After plot", str(artifacts.after_plot_path)),
+                ("Comparison plot", str(artifacts.comparison_plot_path)),
+                ("Noise profile plot", str(artifacts.noise_profile_plot_path)),
+            ],
+            columns=["Artifact", "Path"],
+        )
+        st.table(files_df)
 
 
 def main() -> None:
@@ -909,13 +934,12 @@ def main() -> None:
     st.markdown(
         """
         <section class="hero">
-            <div class="hero-kicker">Streamlit Demo</div>
-            <h1>Elephant Noise Cleanup Studio</h1>
+            <div class="hero-kicker">Focused Demo</div>
+            <h1>Elephant Noise Cleanup Output Review</h1>
             <p>
-                Choose a verified elephant call from the sidebar, review its metadata,
-                and run a focused cleanup pass on that exact time window. The app keeps
-                the experience simple: original versus cleaned spectrograms, original
-                versus cleaned audio, and the key details needed to judge the result.
+                This page is locked to one saved pipeline result. Instead of browsing many
+                selections, it reads the existing files in <code>outputs/</code> and shows the
+                original buffered clip plus the three cleaned variants for that same recording.
             </p>
         </section>
         """,
@@ -923,168 +947,29 @@ def main() -> None:
     )
 
     try:
-        mapping_df = load_mapping()
-    except FileNotFoundError as exc:
-        st.error(str(exc))
+        example = load_demo_example()
+    except Exception as exc:
+        st.error(f"Unable to load the demo output: {exc}")
         return
 
-    if mapping_df.empty:
-        st.warning("The mapping CSV loaded successfully, but it does not contain valid selections.")
-        return
+    render_metadata(example)
+    render_original_section(example)
 
-    try:
-        selected_row = render_sidebar(mapping_df)
-    except ValueError as exc:
-        st.warning(str(exc))
-        return
-
-    current_selection = int(selected_row["Selection"])
-    if st.session_state.get("active_selection") != current_selection:
-        st.session_state["active_selection"] = current_selection
-        st.session_state.pop("processing_result", None)
-
-    render_selected_call_metadata(selected_row)
-
-    preview_assets = prepare_original_assets(selected_row)
-
-    spectrogram_view_mode = st.radio(
-        "Spectrogram view",
-        options=list(SPECTROGRAM_VIEW_OPTIONS.keys()),
-        format_func=lambda option: SPECTROGRAM_VIEW_OPTIONS[option],
-        horizontal=True,
-    )
-    st.caption(
-        "Switch between the standard heatmap, a contour-style view, and a 3D perspective diagram."
+    st.markdown("<h2 class='section-title'>Cleaned Outputs</h2>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <p class='section-copy'>
+            Each section below shows one cleaned audio output for the same source recording,
+            along with its saved spectrogram set from the current pipeline.
+        </p>
+        """,
+        unsafe_allow_html=True,
     )
 
-    st.session_state.setdefault("camera_preset_selector", DEFAULT_CAMERA_PRESET)
-    st.session_state.setdefault("auto_cycle_cameras", False)
-    st.session_state.setdefault("last_camera_cycle_at", 0.0)
-
-    action_columns = st.columns([0.9, 2.1])
-    with action_columns[0]:
-        run_requested = st.button("Run Cleaning", type="primary", use_container_width=True)
-    with action_columns[1]:
-        st.markdown(
-            """
-            <div class="info-chip">
-                Cleaning runs only on the selected call window and saves reusable demo
-                artifacts so you can revisit the same example without hunting for files.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    if run_requested:
-        with st.spinner("Cleaning the selected call..."):
-            try:
-                st.session_state["processing_result"] = process_call(selected_row)
-            except Exception as exc:
-                st.error(f"Cleaning failed: {exc}")
-
-    result = st.session_state.get("processing_result")
-
-    fragment_refresh_interval = (
-        AUTO_CAMERA_CYCLE_SECONDS
-        if spectrogram_view_mode == "perspective_3d"
-        and bool(st.session_state.get("auto_cycle_cameras", False))
-        else None
-    )
-
-    @st.fragment(run_every=fragment_refresh_interval)
-    def render_spectrogram_workspace() -> None:
-        preset_keys = list(CAMERA_PRESET_OPTIONS.keys())
-
-        if st.session_state.get("camera_preset_selector") not in preset_keys:
-            st.session_state["camera_preset_selector"] = DEFAULT_CAMERA_PRESET
-
-        auto_cycle_enabled = bool(st.session_state.get("auto_cycle_cameras", False))
-        auto_cycle_active = auto_cycle_enabled and spectrogram_view_mode == "perspective_3d"
-
-        if auto_cycle_active:
-            now = time.time()
-            last_cycle_at = float(st.session_state.get("last_camera_cycle_at", 0.0))
-            if last_cycle_at <= 0.0:
-                st.session_state["last_camera_cycle_at"] = now
-            elif now - last_cycle_at >= AUTO_CAMERA_CYCLE_SECONDS:
-                current_preset = st.session_state.get("camera_preset_selector", DEFAULT_CAMERA_PRESET)
-                current_index = preset_keys.index(current_preset)
-                next_preset = preset_keys[(current_index + 1) % len(preset_keys)]
-                st.session_state["camera_preset_selector"] = next_preset
-                st.session_state["last_camera_cycle_at"] = now
-        else:
-            st.session_state["last_camera_cycle_at"] = 0.0
-
-        if spectrogram_view_mode == "perspective_3d":
-            camera_columns = st.columns([1.8, 0.9], gap="large")
-            with camera_columns[0]:
-                selected_camera_preset = st.radio(
-                    "3D camera preset",
-                    options=preset_keys,
-                    format_func=lambda preset: CAMERA_PRESET_OPTIONS[preset]["label"],
-                    horizontal=True,
-                    key="camera_preset_selector",
-                )
-            with camera_columns[1]:
-                st.toggle(
-                    "Auto cycle perspectives",
-                    key="auto_cycle_cameras",
-                    help="Cycle through the 3D camera presets automatically. Turn this off any time.",
-                )
-
-            if st.session_state.get("auto_cycle_cameras", False):
-                st.caption("Camera auto-cycle is on. Disable the toggle to stop rotating through presets.")
-        else:
-            selected_camera_preset = st.session_state.get("camera_preset_selector", DEFAULT_CAMERA_PRESET)
-            if st.session_state.get("auto_cycle_cameras", False):
-                st.caption("Auto-cycle is available in the 3D spectrogram view.")
-
-        result_columns = st.columns(2, gap="large")
-        with result_columns[0]:
-            render_panel(
-                title="Original Call",
-                copy=(
-                    "Baseline view of the selected elephant call segment before noise "
-                    "reduction. This uses the clip extracted from the mapping timestamps."
-                ),
-                spectrogram_path=preview_assets["original_spectrogram_path"],
-                spectrogram_magnitude=preview_assets["original_magnitude"],
-                spectrogram_sample_rate=preview_assets["sample_rate"],
-                spectrogram_view_mode=spectrogram_view_mode,
-                camera_preset=selected_camera_preset,
-                audio_path=preview_assets["original_audio_path"],
-                image_caption="Original spectrogram",
-                audio_caption="Original audio",
-            )
-
-        with result_columns[1]:
-            if result and result["selection_id"] == current_selection:
-                render_panel(
-                    title="Cleaned Call",
-                    copy=(
-                        "Noise-reduced output generated from the selected clip using the "
-                        "current spectral subtraction settings."
-                    ),
-                    spectrogram_path=result["cleaned_spectrogram_path"],
-                    spectrogram_magnitude=result["cleaned_magnitude"],
-                    spectrogram_sample_rate=result["sample_rate"],
-                    spectrogram_view_mode=spectrogram_view_mode,
-                    camera_preset=selected_camera_preset,
-                    audio_path=result["cleaned_audio_path"],
-                    image_caption="Cleaned spectrogram",
-                    audio_caption="Cleaned audio",
-                )
-                st.caption(f"Reference spectrogram on file: {result['reference_spectrogram_path']}")
-            else:
-                render_panel(
-                    title="Cleaned Call",
-                    copy=(
-                        "Run cleaning to generate the denoised clip and its spectrogram for "
-                        "this selection."
-                    ),
-                )
-
-    render_spectrogram_workspace()
+    for index, mode in enumerate(NOISE_MODE_ORDER):
+        render_mode_section(example.modes[mode])
+        if index < len(NOISE_MODE_ORDER) - 1:
+            st.divider()
 
 
 if __name__ == "__main__":

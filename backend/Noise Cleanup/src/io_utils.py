@@ -15,7 +15,7 @@ from typing import Tuple
 import pandas as pd
 import soundfile as sf
 
-from config import (
+from .config import (
     ANNOTATIONS_CSV_PATH,
     MAPPING_CSV_PATH,
     CLEANED_AUDIO_DIR,

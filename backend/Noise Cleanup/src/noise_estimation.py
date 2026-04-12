@@ -12,8 +12,8 @@ from typing import Tuple
 
 import numpy as np
 
-from config import NOISE_BUFFER_SEC, EPSILON
-from spectrogram_utils import time_to_sample, time_to_frame
+from .config import NOISE_BUFFER_SEC, EPSILON
+from .spectrogram_utils import time_to_sample, time_to_frame
 
 
 def get_noise_windows(
