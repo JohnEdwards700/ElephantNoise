@@ -984,7 +984,14 @@ def main() -> None:
 
     result = st.session_state.get("processing_result")
 
-    @st.fragment(run_every=2.4)
+    fragment_refresh_interval = (
+        AUTO_CAMERA_CYCLE_SECONDS
+        if spectrogram_view_mode == "perspective_3d"
+        and bool(st.session_state.get("auto_cycle_cameras", False))
+        else None
+    )
+
+    @st.fragment(run_every=fragment_refresh_interval)
     def render_spectrogram_workspace() -> None:
         preset_keys = list(CAMERA_PRESET_OPTIONS.keys())
 
