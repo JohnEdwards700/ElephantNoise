@@ -1,28 +1,219 @@
-"""Noise profile estimation from audio magnitude spectrograms."""
+"""
+Noise estimation utilities for ElephantNoise.
+
+This file handles:
+- selecting pre-call and post-call noise windows
+- converting those windows into STFT frame ranges
+- estimating an average frequency-wise noise profile
+"""
+
+from typing import Tuple
 
 import numpy as np
 
+from config import NOISE_BUFFER_SEC, EPSILON
+from spectrogram_utils import time_to_sample, time_to_frame
 
-def estimate_noise_profile(magnitude, percentile=10):
-    """Estimate the noise floor as a per-frequency percentile of the magnitude.
 
-    Parameters
-    ----------
-    magnitude : np.ndarray, shape (n_freqs, n_frames)
-        Magnitude spectrogram.
-    percentile : int
-        Percentile along the time axis used to estimate the noise floor.
-
-    Returns
-    -------
-    noise_profile : np.ndarray, shape (n_freqs,)
-        Estimated noise magnitude per frequency bin.
+def get_noise_windows(
+    y: np.ndarray,
+    sr: int,
+    start_time: float,
+    end_time: float,
+    buffer_sec: float = NOISE_BUFFER_SEC,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
-    noise_profile = np.percentile(magnitude, percentile, axis=1)
+    Return sample-index windows for the pre-call and post-call noise regions.
+
+    Args:
+        y: audio waveform
+        sr: sample rate
+        start_time: annotated call start time in seconds
+        end_time: annotated call end time in seconds
+        buffer_sec: amount of audio to use before and after the call
+
+    Returns:
+        ((pre_start, pre_end), (post_start, post_end)) in sample indices
+    """
+    n_samples = len(y)
+
+    call_start_sample = time_to_sample(start_time, sr)
+    call_end_sample = time_to_sample(end_time, sr)
+
+    pre_start = max(0, call_start_sample - time_to_sample(buffer_sec, sr))
+    pre_end = max(0, call_start_sample)
+
+    post_start = min(n_samples, call_end_sample)
+    post_end = min(n_samples, call_end_sample + time_to_sample(buffer_sec, sr))
+
+    return (pre_start, pre_end), (post_start, post_end)
+
+
+def get_noise_frame_ranges(
+    sr: int,
+    start_time: float,
+    end_time: float,
+    buffer_sec: float = NOISE_BUFFER_SEC,
+    hop_length: int = 512,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """
+    Return STFT frame-index ranges for the pre-call and post-call noise regions.
+
+    Args:
+        sr: sample rate
+        start_time: annotated call start time in seconds
+        end_time: annotated call end time in seconds
+        buffer_sec: amount of audio to use before and after the call
+        hop_length: STFT hop length
+
+    Returns:
+        ((pre_start_frame, pre_end_frame), (post_start_frame, post_end_frame))
+    """
+    pre_start_time = max(0.0, start_time - buffer_sec)
+    pre_end_time = max(0.0, start_time)
+
+    post_start_time = max(0.0, end_time)
+    post_end_time = max(post_start_time, end_time + buffer_sec)
+
+    pre_start_frame = time_to_frame(pre_start_time, sr, hop_length)
+    pre_end_frame = time_to_frame(pre_end_time, sr, hop_length)
+
+    post_start_frame = time_to_frame(post_start_time, sr, hop_length)
+    post_end_frame = time_to_frame(post_end_time, sr, hop_length)
+
+    return (pre_start_frame, pre_end_frame), (post_start_frame, post_end_frame)
+
+
+def estimate_noise_profile(
+    mag_spectrogram: np.ndarray,
+    call_frame_start: int,
+    call_frame_end: int,
+) -> np.ndarray:
+    """
+    Estimate a frequency-wise noise profile from frames outside the call region.
+
+    This function uses:
+    - frames before the call
+    - frames after the call
+
+    Args:
+        mag_spectrogram: magnitude spectrogram of shape (freq_bins, time_frames)
+        call_frame_start: start frame of the call
+        call_frame_end: end frame of the call
+
+    Returns:
+        noise_profile: 1D array of shape (freq_bins,)
+    """
+    if mag_spectrogram.ndim != 2:
+        raise ValueError(
+            f"Expected 2D magnitude spectrogram, got shape {mag_spectrogram.shape}"
+        )
+
+    n_freqs, n_frames = mag_spectrogram.shape
+
+    call_frame_start = max(0, min(call_frame_start, n_frames))
+    call_frame_end = max(0, min(call_frame_end, n_frames))
+
+    if call_frame_end <= call_frame_start:
+        raise ValueError(
+            f"Invalid call frame range: start={call_frame_start}, end={call_frame_end}"
+        )
+
+    pre_frames = mag_spectrogram[:, :call_frame_start]
+    post_frames = mag_spectrogram[:, call_frame_end:]
+
+    available_regions = []
+    if pre_frames.shape[1] > 0:
+        available_regions.append(pre_frames)
+    if post_frames.shape[1] > 0:
+        available_regions.append(post_frames)
+
+    if not available_regions:
+        raise ValueError("No noise-only frames available before or after the call region.")
+
+    noise_frames = np.concatenate(available_regions, axis=1)
+
+    # Average across time frames to get one noise estimate per frequency bin
+    noise_profile = np.mean(noise_frames, axis=1)
+
+    # Keep values strictly positive for numerical stability
+    noise_profile = np.maximum(noise_profile, EPSILON)
+
+    if noise_profile.shape != (n_freqs,):
+        raise ValueError(
+            f"Unexpected noise profile shape: {noise_profile.shape}, expected ({n_freqs},)"
+        )
+
     return noise_profile
 
 
-def smooth_noise_profile(noise_profile, window_size=5):
-    """Apply a simple moving-average smoothing to the noise profile."""
-    kernel = np.ones(window_size) / window_size
-    return np.convolve(noise_profile, kernel, mode="same")
+def estimate_noise_profile_from_frame_ranges(
+    mag_spectrogram: np.ndarray,
+    pre_frame_range: Tuple[int, int],
+    post_frame_range: Tuple[int, int],
+) -> np.ndarray:
+    """
+    Estimate a frequency-wise noise profile using explicit pre/post frame ranges.
+
+    Args:
+        mag_spectrogram: magnitude spectrogram of shape (freq_bins, time_frames)
+        pre_frame_range: (start_frame, end_frame) before the call
+        post_frame_range: (start_frame, end_frame) after the call
+
+    Returns:
+        noise_profile: 1D array of shape (freq_bins,)
+    """
+    if mag_spectrogram.ndim != 2:
+        raise ValueError(
+            f"Expected 2D magnitude spectrogram, got shape {mag_spectrogram.shape}"
+        )
+
+    n_freqs, n_frames = mag_spectrogram.shape
+
+    pre_start, pre_end = pre_frame_range
+    post_start, post_end = post_frame_range
+
+    pre_start = max(0, min(pre_start, n_frames))
+    pre_end = max(0, min(pre_end, n_frames))
+    post_start = max(0, min(post_start, n_frames))
+    post_end = max(0, min(post_end, n_frames))
+
+    available_regions = []
+
+    if pre_end > pre_start:
+        available_regions.append(mag_spectrogram[:, pre_start:pre_end])
+
+    if post_end > post_start:
+        available_regions.append(mag_spectrogram[:, post_start:post_end])
+
+    if not available_regions:
+        raise ValueError("No valid pre/post noise frame ranges available.")
+
+    noise_frames = np.concatenate(available_regions, axis=1)
+    noise_profile = np.mean(noise_frames, axis=1)
+    noise_profile = np.maximum(noise_profile, EPSILON)
+
+    if noise_profile.shape != (n_freqs,):
+        raise ValueError(
+            f"Unexpected noise profile shape: {noise_profile.shape}, expected ({n_freqs},)"
+        )
+
+    return noise_profile
+
+
+if __name__ == "__main__":
+    # Simple smoke test
+    rng = np.random.default_rng(42)
+
+    # Fake magnitude spectrogram: (freq_bins, time_frames)
+    mag = np.abs(rng.normal(size=(257, 100)))
+
+    # Fake call region from frame 30 to 60
+    call_start = 30
+    call_end = 60
+
+    noise_profile = estimate_noise_profile(mag, call_start, call_end)
+
+    print("Magnitude spectrogram shape:", mag.shape)
+    print("Noise profile shape:", noise_profile.shape)
+    print("First 10 noise profile values:", noise_profile[:10])
