@@ -151,17 +151,27 @@ def save_audio(output_path: str | Path, y, sr: int) -> Path:
     return path
 
 
-def build_cleaned_audio_path(selection: int, sound_file: str) -> Path:
+def build_cleaned_audio_path(
+    selection: int,
+    sound_file: str,
+    noise_mode: str | None = None,
+) -> Path:
     """
     Build a standardized cleaned-audio output path.
 
-    Example output:
+    Example outputs:
         outputs/cleaned_audio/04-040920-02_vehicle_1_selection_1_cleaned.wav
+        outputs/cleaned_audio/04-040920-02_vehicle_1_selection_1_post_cleaned.wav
     """
     ensure_output_dirs()
 
     stem = Path(sound_file).stem
-    filename = f"{stem}_selection_{selection}_cleaned.wav"
+
+    if noise_mode is None:
+        filename = f"{stem}_selection_{selection}_cleaned.wav"
+    else:
+        filename = f"{stem}_selection_{selection}_{noise_mode}_cleaned.wav"
+
     return CLEANED_AUDIO_DIR / filename
 
 
@@ -202,3 +212,9 @@ if __name__ == "__main__":
         y, sr = load_audio(info["audio_path"])
         print(f"Loaded audio shape: {getattr(y, 'shape', 'unknown')}")
         print(f"Sample rate: {sr}")
+
+        # Example output path generation
+        print("Example cleaned audio paths:")
+        print(build_cleaned_audio_path(first_selection, info["sound_file"], noise_mode="pre"))
+        print(build_cleaned_audio_path(first_selection, info["sound_file"], noise_mode="post"))
+        print(build_cleaned_audio_path(first_selection, info["sound_file"], noise_mode="both"))

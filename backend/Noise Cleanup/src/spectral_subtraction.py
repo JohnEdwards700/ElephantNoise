@@ -5,6 +5,8 @@ This file handles:
 - subtracting an estimated noise profile from a magnitude spectrogram
 - applying a floor value to reduce harsh artifacts
 - optionally smoothing the cleaned result slightly
+- tapering subtraction strength around a call region
+- applying weaker subtraction below a chosen frequency threshold
 """
 
 import numpy as np
@@ -22,14 +24,6 @@ def apply_floor(
 
     For each time-frequency bin:
         floored_mag = max(clean_mag, beta * original_mag)
-
-    Args:
-        clean_mag: cleaned magnitude spectrogram
-        original_mag: original magnitude spectrogram
-        beta: floor factor
-
-    Returns:
-        floored magnitude spectrogram
     """
     if clean_mag.shape != original_mag.shape:
         raise ValueError(
@@ -48,17 +42,6 @@ def smooth_spectrogram(
 ) -> np.ndarray:
     """
     Apply simple local averaging to lightly smooth a magnitude spectrogram.
-
-    This is optional and meant to slightly reduce patchy artifacts.
-    It uses a small mean filter implemented with NumPy only.
-
-    Args:
-        mag: 2D magnitude spectrogram (freq_bins, time_frames)
-        kernel_size_time: smoothing width across time
-        kernel_size_freq: smoothing width across frequency
-
-    Returns:
-        Smoothed magnitude spectrogram
     """
     if mag.ndim != 2:
         raise ValueError(f"Expected 2D spectrogram, got shape {mag.shape}")
@@ -88,6 +71,80 @@ def smooth_spectrogram(
     return smoothed
 
 
+def build_time_weight_mask(
+    n_frames: int,
+    call_frame_start: int | None = None,
+    call_frame_end: int | None = None,
+    transition_frames: int = 8,
+) -> np.ndarray:
+    """
+    Build a soft time weighting mask for subtraction strength.
+
+    Returns a 1D vector of length n_frames with values in [0, 1].
+    """
+    weights = np.ones(n_frames, dtype=float)
+
+    if call_frame_start is None or call_frame_end is None:
+        return weights
+
+    call_frame_start = max(0, min(call_frame_start, n_frames))
+    call_frame_end = max(0, min(call_frame_end, n_frames))
+
+    if call_frame_end <= call_frame_start:
+        return weights
+
+    # Gentle subtraction outside the call
+    weights[:] = 0.2
+
+    # Strongest subtraction inside the call
+    weights[call_frame_start:call_frame_end] = 1.0
+
+    if transition_frames > 0:
+        left_start = max(0, call_frame_start - transition_frames)
+        left_end = call_frame_start
+        if left_end > left_start:
+            ramp = np.linspace(0.35, 1.0, left_end - left_start, endpoint=False)
+            weights[left_start:left_end] = ramp
+
+        right_start = call_frame_end
+        right_end = min(n_frames, call_frame_end + transition_frames)
+        if right_end > right_start:
+            ramp = np.linspace(1.0, 0.35, right_end - right_start, endpoint=False)
+            weights[right_start:right_end] = ramp
+
+    return weights
+
+
+def build_frequency_weight_profile(
+    n_freqs: int,
+    sr: int,
+    low_freq_threshold_hz: float = 120.0,
+    mid_freq_threshold_hz: float = 250.0,
+    low_freq_scale: float = 0.4,
+    mid_freq_scale: float = 0.7,
+) -> np.ndarray:
+    """
+    Build a frequency-dependent weighting profile for the noise subtraction.
+
+    Idea:
+    - Below low_freq_threshold_hz: protect the rumble band more
+    - Between low_freq_threshold_hz and mid_freq_threshold_hz: moderate subtraction
+    - Above mid_freq_threshold_hz: normal subtraction
+
+    Returns:
+        1D vector of shape (n_freqs,)
+    """
+    freqs = np.linspace(0, sr / 2, n_freqs)
+    freq_weights = np.ones(n_freqs, dtype=float)
+
+    freq_weights[freqs < low_freq_threshold_hz] = low_freq_scale
+
+    mid_mask = (freqs >= low_freq_threshold_hz) & (freqs < mid_freq_threshold_hz)
+    freq_weights[mid_mask] = mid_freq_scale
+
+    return freq_weights
+
+
 def spectral_subtract(
     mag: np.ndarray,
     noise_profile: np.ndarray,
@@ -96,12 +153,21 @@ def spectral_subtract(
     alpha: float = ALPHA,
     beta: float = BETA,
     smooth: bool = False,
+    use_soft_time_mask: bool = True,
+    transition_frames: int = 8,
+    sr: int = 2000,
+    use_frequency_weighting: bool = True,
+    low_freq_threshold_hz: float = 120.0,
+    mid_freq_threshold_hz: float = 250.0,
+    low_freq_scale: float = 0.4,
+    mid_freq_scale: float = 0.7,
 ) -> np.ndarray:
     """
     Apply spectral subtraction in the magnitude domain.
 
     Core formula:
-        clean_mag = max(noisy_mag - alpha * noise_profile, beta * noisy_mag)
+        clean_mag = max(noisy_mag - alpha * time_weight(t) * freq_weight(f) * noise_profile,
+                        beta * noisy_mag)
 
     Args:
         mag: original magnitude spectrogram of shape (freq_bins, time_frames)
@@ -111,6 +177,14 @@ def spectral_subtract(
         alpha: subtraction strength
         beta: floor factor
         smooth: whether to lightly smooth the cleaned result
+        use_soft_time_mask: whether to taper subtraction around the call region
+        transition_frames: number of frames used to ramp subtraction strength
+        sr: sample rate for frequency-axis weighting
+        use_frequency_weighting: whether to protect low frequencies
+        low_freq_threshold_hz: below this, subtraction is reduced strongly
+        mid_freq_threshold_hz: between low and mid thresholds, subtraction is reduced moderately
+        low_freq_scale: scaling factor below low_freq_threshold_hz
+        mid_freq_scale: scaling factor between thresholds
 
     Returns:
         cleaned magnitude spectrogram
@@ -129,56 +203,56 @@ def spectral_subtract(
             f"Got {noise_profile.shape[0]} and {n_freqs}."
         )
 
-    # Default: apply subtraction to the full spectrogram
-    if call_frame_start is None:
-        call_frame_start = 0
-    if call_frame_end is None:
-        call_frame_end = n_frames
-
-    call_frame_start = max(0, min(call_frame_start, n_frames))
-    call_frame_end = max(0, min(call_frame_end, n_frames))
-
-    if call_frame_end <= call_frame_start:
-        raise ValueError(
-            f"Invalid call frame range: start={call_frame_start}, end={call_frame_end}"
+    if use_soft_time_mask:
+        time_weights = build_time_weight_mask(
+            n_frames=n_frames,
+            call_frame_start=call_frame_start,
+            call_frame_end=call_frame_end,
+            transition_frames=transition_frames,
         )
+    else:
+        time_weights = np.ones(n_frames, dtype=float)
 
-    cleaned_mag = mag.copy()
+    if use_frequency_weighting:
+        freq_weights = build_frequency_weight_profile(
+            n_freqs=n_freqs,
+            sr=sr,
+            low_freq_threshold_hz=low_freq_threshold_hz,
+            mid_freq_threshold_hz=mid_freq_threshold_hz,
+            low_freq_scale=low_freq_scale,
+            mid_freq_scale=mid_freq_scale,
+        )
+    else:
+        freq_weights = np.ones(n_freqs, dtype=float)
 
-    # Expand noise profile to match the selected time range
+    # Expand dimensions for broadcasting
     noise_matrix = noise_profile[:, np.newaxis]
+    freq_weight_matrix = freq_weights[:, np.newaxis]
+    time_weight_matrix = time_weights[np.newaxis, :]
 
-    target_region = mag[:, call_frame_start:call_frame_end]
+    weighted_noise = alpha * noise_matrix * freq_weight_matrix * time_weight_matrix
 
-    # Raw subtraction
-    subtracted = target_region - alpha * noise_matrix
+    # Raw subtraction across the full crop
+    subtracted = mag - weighted_noise
 
     # Prevent negatives
     subtracted = np.maximum(subtracted, 0.0)
 
-    # Apply floor
-    floored = apply_floor(subtracted, target_region, beta=beta)
+    # Apply floor against the original full spectrogram
+    floored = apply_floor(subtracted, mag, beta=beta)
 
-    # Optional light smoothing
+    # Optional smoothing
     if smooth:
         floored = smooth_spectrogram(floored, kernel_size_time=3, kernel_size_freq=1)
 
-    cleaned_mag[:, call_frame_start:call_frame_end] = floored
-
-    # Numerical safety
-    cleaned_mag = np.maximum(cleaned_mag, EPSILON)
-
+    cleaned_mag = np.maximum(floored, EPSILON)
     return cleaned_mag
 
 
 if __name__ == "__main__":
-    # Simple smoke test
     rng = np.random.default_rng(42)
 
-    # Fake magnitude spectrogram: (freq_bins, time_frames)
     mag = np.abs(rng.normal(size=(257, 100)))
-
-    # Fake noise profile
     noise_profile = np.mean(mag[:, :10], axis=1)
 
     cleaned = spectral_subtract(
@@ -186,9 +260,17 @@ if __name__ == "__main__":
         noise_profile=noise_profile,
         call_frame_start=20,
         call_frame_end=80,
-        alpha=1.2,
-        beta=0.05,
+        alpha=0.9,
+        beta=0.1,
         smooth=True,
+        use_soft_time_mask=True,
+        transition_frames=8,
+        sr=2000,
+        use_frequency_weighting=True,
+        low_freq_threshold_hz=120.0,
+        mid_freq_threshold_hz=250.0,
+        low_freq_scale=0.4,
+        mid_freq_scale=0.7,
     )
 
     print("Original shape:", mag.shape)

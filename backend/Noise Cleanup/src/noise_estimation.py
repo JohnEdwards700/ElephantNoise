@@ -5,6 +5,7 @@ This file handles:
 - selecting pre-call and post-call noise windows
 - converting those windows into STFT frame ranges
 - estimating an average frequency-wise noise profile
+- allowing selection of pre-only, post-only, or both windows
 """
 
 from typing import Tuple
@@ -24,16 +25,6 @@ def get_noise_windows(
 ) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Return sample-index windows for the pre-call and post-call noise regions.
-
-    Args:
-        y: audio waveform
-        sr: sample rate
-        start_time: annotated call start time in seconds
-        end_time: annotated call end time in seconds
-        buffer_sec: amount of audio to use before and after the call
-
-    Returns:
-        ((pre_start, pre_end), (post_start, post_end)) in sample indices
     """
     n_samples = len(y)
 
@@ -58,16 +49,6 @@ def get_noise_frame_ranges(
 ) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Return STFT frame-index ranges for the pre-call and post-call noise regions.
-
-    Args:
-        sr: sample rate
-        start_time: annotated call start time in seconds
-        end_time: annotated call end time in seconds
-        buffer_sec: amount of audio to use before and after the call
-        hop_length: STFT hop length
-
-    Returns:
-        ((pre_start_frame, pre_end_frame), (post_start_frame, post_end_frame))
     """
     pre_start_time = max(0.0, start_time - buffer_sec)
     pre_end_time = max(0.0, start_time)
@@ -91,18 +72,6 @@ def estimate_noise_profile(
 ) -> np.ndarray:
     """
     Estimate a frequency-wise noise profile from frames outside the call region.
-
-    This function uses:
-    - frames before the call
-    - frames after the call
-
-    Args:
-        mag_spectrogram: magnitude spectrogram of shape (freq_bins, time_frames)
-        call_frame_start: start frame of the call
-        call_frame_end: end frame of the call
-
-    Returns:
-        noise_profile: 1D array of shape (freq_bins,)
     """
     if mag_spectrogram.ndim != 2:
         raise ValueError(
@@ -132,11 +101,7 @@ def estimate_noise_profile(
         raise ValueError("No noise-only frames available before or after the call region.")
 
     noise_frames = np.concatenate(available_regions, axis=1)
-
-    # Average across time frames to get one noise estimate per frequency bin
     noise_profile = np.mean(noise_frames, axis=1)
-
-    # Keep values strictly positive for numerical stability
     noise_profile = np.maximum(noise_profile, EPSILON)
 
     if noise_profile.shape != (n_freqs,):
@@ -151,6 +116,7 @@ def estimate_noise_profile_from_frame_ranges(
     mag_spectrogram: np.ndarray,
     pre_frame_range: Tuple[int, int],
     post_frame_range: Tuple[int, int],
+    noise_mode: str = "both",
 ) -> np.ndarray:
     """
     Estimate a frequency-wise noise profile using explicit pre/post frame ranges.
@@ -159,6 +125,7 @@ def estimate_noise_profile_from_frame_ranges(
         mag_spectrogram: magnitude spectrogram of shape (freq_bins, time_frames)
         pre_frame_range: (start_frame, end_frame) before the call
         post_frame_range: (start_frame, end_frame) after the call
+        noise_mode: one of {"pre", "post", "both"}
 
     Returns:
         noise_profile: 1D array of shape (freq_bins,)
@@ -166,6 +133,11 @@ def estimate_noise_profile_from_frame_ranges(
     if mag_spectrogram.ndim != 2:
         raise ValueError(
             f"Expected 2D magnitude spectrogram, got shape {mag_spectrogram.shape}"
+        )
+
+    if noise_mode not in {"pre", "post", "both"}:
+        raise ValueError(
+            f"Invalid noise_mode='{noise_mode}'. Expected one of: 'pre', 'post', 'both'"
         )
 
     n_freqs, n_frames = mag_spectrogram.shape
@@ -180,14 +152,16 @@ def estimate_noise_profile_from_frame_ranges(
 
     available_regions = []
 
-    if pre_end > pre_start:
+    if noise_mode in {"pre", "both"} and pre_end > pre_start:
         available_regions.append(mag_spectrogram[:, pre_start:pre_end])
 
-    if post_end > post_start:
+    if noise_mode in {"post", "both"} and post_end > post_start:
         available_regions.append(mag_spectrogram[:, post_start:post_end])
 
     if not available_regions:
-        raise ValueError("No valid pre/post noise frame ranges available.")
+        raise ValueError(
+            f"No valid noise frames available for noise_mode='{noise_mode}'."
+        )
 
     noise_frames = np.concatenate(available_regions, axis=1)
     noise_profile = np.mean(noise_frames, axis=1)
@@ -202,18 +176,17 @@ def estimate_noise_profile_from_frame_ranges(
 
 
 if __name__ == "__main__":
-    # Simple smoke test
     rng = np.random.default_rng(42)
 
-    # Fake magnitude spectrogram: (freq_bins, time_frames)
     mag = np.abs(rng.normal(size=(257, 100)))
+    pre_range = (10, 20)
+    post_range = (80, 95)
 
-    # Fake call region from frame 30 to 60
-    call_start = 30
-    call_end = 60
-
-    noise_profile = estimate_noise_profile(mag, call_start, call_end)
-
-    print("Magnitude spectrogram shape:", mag.shape)
-    print("Noise profile shape:", noise_profile.shape)
-    print("First 10 noise profile values:", noise_profile[:10])
+    for mode in ["pre", "post", "both"]:
+        profile = estimate_noise_profile_from_frame_ranges(
+            mag_spectrogram=mag,
+            pre_frame_range=pre_range,
+            post_frame_range=post_range,
+            noise_mode=mode,
+        )
+        print(f"Mode={mode}, profile shape={profile.shape}, first 5={profile[:5]}")
